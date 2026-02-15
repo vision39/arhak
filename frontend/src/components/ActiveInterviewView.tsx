@@ -520,8 +520,8 @@ const ActiveInterviewView: React.FC<ActiveInterviewViewProps> = ({ onLeave, onCo
                 <div className="grid grid-cols-2 gap-4 h-16 lg:h-16 shrink-0">
                     <button
                         onClick={() => handleNext(true)}
-                        disabled={status === 'countdown' || isSubmitting}
-                        className={`flex items-center justify-center gap-2 border-2 rounded-2xl font-bold transition-all text-sm lg:text-base ${status === 'countdown' ? 'bg-slate-100 border-slate-200 text-slate-300 cursor-not-allowed' : 'bg-white hover:bg-slate-50 border-slate-200 text-slate-600 active:scale-95'}`}
+                        disabled={isSubmitting}
+                        className={`flex items-center justify-center gap-2 border-2 rounded-2xl font-bold transition-all text-sm lg:text-base ${isSubmitting ? 'bg-slate-100 border-slate-200 text-slate-300 cursor-not-allowed' : 'bg-white hover:bg-slate-50 border-slate-200 text-slate-600 active:scale-95'}`}
                     >
                         Pass
                     </button>
