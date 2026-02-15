@@ -483,6 +483,7 @@ You are the Analyst.
             session = getSession(sessionId)!;
         }
 
+        console.log(JSON.stringify(session, null, 2));
         res.json({ analysis: session.analysis });
     } catch (error) {
         console.error('❌ Analysis error:', error);
