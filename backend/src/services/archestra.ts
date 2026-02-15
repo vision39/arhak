@@ -59,7 +59,6 @@ export async function sendToAgent(
         },
         body: JSON.stringify(body),
     });
-
     if (!response.ok) {
         const errorText = await response.text();
         console.error(`  ✗ A2A API error (${response.status}):`, errorText);
@@ -71,6 +70,32 @@ export async function sendToAgent(
 
     // Extract text from A2A JSON-RPC response
     return extractA2AResponse(data);
+}
+
+/**
+ * Send the full interview context to an agent and ask for an update.
+ * The agent is expected to return a JSON object (partial or full session update).
+ */
+export async function sendContextToAgent<T>(
+    agentId: string,
+    context: Record<string, unknown>,
+    instruction: string
+): Promise<T> {
+    const prompt = `
+SYSTEM CONTEXT:
+${JSON.stringify(context, null, 2)}
+
+INSTRUCTION:
+${instruction}
+
+Respond with ONLY a JSON object representing the result/update.
+`;
+
+    const responseText = await sendToAgent(agentId, [
+        { role: 'user', content: prompt }
+    ]);
+
+    return parseAgentJSON<T>(responseText);
 }
 
 /**

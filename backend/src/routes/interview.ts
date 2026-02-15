@@ -3,7 +3,7 @@
  * Orchestrates the 4-agent swarm for adaptive interviews
  */
 import { Router, Request, Response } from 'express';
-import { sendToAgent, parseAgentJSON } from '../services/archestra.js';
+import { sendToAgent, sendContextToAgent, parseAgentJSON } from '../services/archestra.js';
 import {
     createSession,
     getSession,
@@ -12,6 +12,7 @@ import {
     recordEvaluation,
     recordCodeReview,
     completeSession,
+    updateSession,
     buildInterviewContext,
     type Difficulty,
     type QuestionRecord,
@@ -71,58 +72,61 @@ interviewRouter.post('/start', async (req: Request, res: Response) => {
         console.log(`\n🎬 Starting interview: ${role} @ ${company}`);
 
         // Create session
-        const session = createSession(role, company);
+        let session = createSession(role, company);
 
         // Ask Interviewer Agent for first question (medium difficulty)
-        const prompt = `
-You are interviewing a candidate for the role of "${role}" at "${company}".
-This is question #1. Difficulty: medium.
-Generate a React JS technical question. Topics can include: React hooks (useState, useEffect, useCallback, useMemo), component lifecycle, state management, props, JSX, virtual DOM, React performance optimization, or React design patterns.
-It should be a "video" type question (not coding).
-Respond with ONLY a JSON object like: {"type":"video","text":"your question","title":"short title","difficulty":"medium"}`;
+        const instruction = `
+You are initializing the interview.
+1. Generate the first technical question (Difficulty: medium, Type: video).
+2. The question text should cover React topics (hooks, state, etc).
+3. Return the FULL updated session object with this new question added to the "questions" array.
+4. Ensure "currentQuestionIndex" is set to 1.
+`;
 
-        const rawResponse = await sendToAgent(getAgents().interviewer, [
-            { role: 'user', content: prompt },
-        ]);
-
-        let question: InterviewerResponse;
         try {
-            question = parseAgentJSON<InterviewerResponse>(rawResponse);
-        } catch {
-            console.warn('  ⚠ Interviewer returned empty/invalid response, using fallback question');
-            question = {
+            const updatedSession = await sendContextToAgent<any>(
+                getAgents().interviewer,
+                session as unknown as Record<string, unknown>,
+                instruction
+            );
+
+            // Update local session store
+            if (updatedSession && updatedSession.questions) {
+                // If agent returned a valid session-like object
+                updateSession(session.id, updatedSession);
+                session = getSession(session.id)!;
+                console.log(`  ✓ First question generated via Agent Context`);
+            } else {
+                throw new Error('Invalid agent response format');
+            }
+
+        } catch (err) {
+            console.warn('  ⚠ Interviewer returned invalid context, using fallback question');
+            // Fallback logic
+            addQuestion(session.id, {
                 type: 'video',
                 text: 'Can you explain the difference between useState and useReducer in React? When would you choose one over the other?',
                 title: 'React State Management',
                 difficulty: 'medium',
-            };
+            });
+            session = getSession(session.id)!;
         }
 
-        // Store the question in the session
-        const stored = addQuestion(session.id, {
-            type: question.type || 'video',
-            text: question.text,
-            title: question.title,
-            difficulty: question.difficulty || 'medium',
-            starterCode: question.starterCode,
-            language: question.language,
-        });
-
-        console.log(`  ✓ First question generated (${stored.difficulty})`);
+        const currentQ = session.questions[session.questions.length - 1];
 
         res.json({
             sessionId: session.id,
             question: {
-                id: stored.id,
-                type: stored.type,
-                text: stored.text,
-                title: stored.title,
-                difficulty: stored.difficulty,
-                starterCode: stored.starterCode,
-                language: stored.language,
+                id: currentQ.id,
+                type: currentQ.type,
+                text: currentQ.text,
+                title: currentQ.title,
+                difficulty: currentQ.difficulty,
+                starterCode: currentQ.starterCode,
+                language: currentQ.language,
             },
             totalQuestions: session.totalVideoQuestions + 1, // +1 for coding
-            currentQuestion: 1,
+            currentQuestion: session.questions.length,
         });
     } catch (error) {
         console.error('❌ Start error:', error);
@@ -145,10 +149,8 @@ interviewRouter.post('/answer', async (req: Request, res: Response) => {
         console.log(`\n📨 Received answer for Q${questionId}:`);
         console.log(`   - Session: ${sessionId}`);
         console.log(`   - Skipped: ${skipped}`);
-        console.log(`   - Transcript length: ${transcript ? transcript.length : 0}`);
-        console.log(`   - Transcript preview: "${transcript ? transcript.substring(0, 50) + '...' : 'N/A'}"`);
 
-        const session = getSession(sessionId);
+        let session = getSession(sessionId);
         if (!session) {
             res.status(404).json({ error: 'Session not found' });
             return;
@@ -160,16 +162,15 @@ interviewRouter.post('/answer', async (req: Request, res: Response) => {
             return;
         }
 
-        let nextDifficulty = session.currentDifficulty;
+        // 1. Locally update with the answer first
+        recordAnswer(sessionId, questionId, skipped ? '' : transcript, skipped);
+        session = getSession(sessionId)!; // Refresh local reference
 
-        let evaluation: EvaluatorResponse;
-
+        // 2. Evaluator Step
         if (skipped) {
-            console.log(`\n⏭ Question Q${questionId} skipped. Moving to next question (keeping ${nextDifficulty} difficulty).`);
-            recordAnswer(sessionId, questionId, '', true);
-
-            // Create a dummy evaluation record for the response
-            evaluation = {
+            console.log(`\n⏭ Question Q${questionId} skipped.`);
+            // Mock evaluation for skipped
+            const skippedEval: EvaluatorResponse = {
                 score: 0,
                 maxScore: 100,
                 difficulty: session.currentDifficulty,
@@ -178,176 +179,111 @@ interviewRouter.post('/answer', async (req: Request, res: Response) => {
                 weaknesses: ['Question skipped'],
                 brief: 'Question skipped by candidate.',
             };
+            recordEvaluation(sessionId, questionId, skippedEval);
         } else {
-            console.log(`\n📝 Evaluating answer for Q${questionId} (${session.role})`);
-            // 1. Record the answer
-            recordAnswer(sessionId, questionId, transcript);
-
-            // 2. Send to Evaluator Agent
-            const evalPrompt = `
-Evaluate this candidate's answer for a "${session.role}" interview.
-
-Question [${currentQ.difficulty}]: ${currentQ.text}
-
-Candidate's Answer: "${transcript}"
-
-Score this answer and determine the next difficulty level.
-Respond with ONLY a JSON object.`;
-
-            const evalRaw = await sendToAgent(getAgents().evaluator, [
-                { role: 'user', content: evalPrompt },
-            ]);
-
+            console.log(`\n📝 Evaluating answer for Q${questionId}...`);
+            const evalInstruction = `
+You are the Evaluator.
+1. Review the latest answer in the session (Question ID: ${questionId}).
+2. Update the session by adding an "evaluation" object to that question.
+3. Update "currentDifficulty" based on performance.
+4. Return the FULL updated session JSON.
+`;
             try {
-                evaluation = parseAgentJSON<EvaluatorResponse>(evalRaw);
-            } catch {
-                console.warn('  ⚠ Evaluator returned empty/invalid response, using fallback');
-                evaluation = {
+                const updatedSession = await sendContextToAgent<any>(
+                    getAgents().evaluator,
+                    session as unknown as Record<string, unknown>,
+                    evalInstruction
+                );
+
+                if (updatedSession && updatedSession.questions) {
+                    updateSession(sessionId, updatedSession);
+                    session = getSession(sessionId)!;
+                    console.log(`  ✓ Evaluation recorded via Agent Context`);
+                }
+            } catch (err) {
+                console.warn('  ⚠ Evaluator failed, using fallback');
+                recordEvaluation(sessionId, questionId, {
                     score: 0,
-                    maxScore: 100,
-                    difficulty: session.currentDifficulty,
                     nextDifficulty: session.currentDifficulty,
                     strengths: [],
                     weaknesses: ['AI evaluation unavailable'],
                     brief: 'Evaluation could not be completed.',
-                };
+                });
             }
-            recordEvaluation(sessionId, questionId, {
-                score: evaluation.score,
-                nextDifficulty: evaluation.nextDifficulty,
-                strengths: evaluation.strengths,
-                weaknesses: evaluation.weaknesses,
-                brief: evaluation.brief,
-            });
-
-            nextDifficulty = evaluation.nextDifficulty;
-            console.log(`  ✓ Score: ${evaluation.score}/100 → next difficulty: ${nextDifficulty}`);
         }
+        session = getSession(sessionId)!; // Refresh
 
-        // 3. Determine what comes next
-        // Count skipped questions as "answered" regarding progression, but we keep asking video questions up to total limit
-        const completedQuestions = session.questions.filter(q => q.type === 'video' && (q.answer || q.skipped)).length;
+        // 3. Interviewer Step (Next Question)
+        const completedQuestions = session.questions.filter(q => q.type === 'video').length;
         const isLastVideoQ = completedQuestions >= session.totalVideoQuestions;
 
-        let nextQuestion: QuestionRecord | null = null;
+        const nextInstruction = isLastVideoQ
+            ? `
+You are the Interviewer.
+1. The candidate has completed the video section.
+2. Generate a "code" type question (React JS coding challenge).
+3. Add it to the "questions" array.
+4. Increment "currentQuestionIndex".
+5. Return the FULL updated session JSON.
+`
+            : `
+You are the Interviewer.
+1. Generate the NEXT video question (React JS) based on the current difficulty (${session.currentDifficulty}).
+2. It must be different from previous questions.
+3. Add it to the "questions" array.
+4. Increment "currentQuestionIndex".
+5. Return the FULL updated session JSON.
+`;
 
-        if (isLastVideoQ) {
-            // Generate a coding question
-            console.log(`  → Generating coding question...`);
+        console.log(`  → Generating next question (isLastVideo=${isLastVideoQ})...`);
 
-            const codePrompt = `
-You are interviewing a candidate for "${session.role}" at "${session.company}".
-This is a React JS coding challenge (final question). Difficulty: ${nextDifficulty}.
+        try {
+            const updatedSession = await sendContextToAgent<any>(
+                getAgents().interviewer,
+                session as unknown as Record<string, unknown>,
+                nextInstruction
+            );
 
-Previous interview context:
-${buildInterviewContext(session)}
-
-Generate a React JS coding challenge. It MUST be type "code" with title, text (problem description), starterCode, and language (javascript).
-The challenge should involve React concepts like: building a custom hook, implementing a component with state management, creating a reusable component, or solving a React-specific problem.
-Respond with ONLY a JSON object like: {"type":"code","text":"description","title":"short title","difficulty":"${nextDifficulty}","starterCode":"// code here","language":"javascript"}`;
-
-            const codeRaw = await sendToAgent(getAgents().interviewer, [
-                { role: 'user', content: codePrompt },
-            ]);
-
-            let codeQ: InterviewerResponse;
-            try {
-                codeQ = parseAgentJSON<InterviewerResponse>(codeRaw);
-            } catch {
-                console.warn('  ⚠ Interviewer returned empty/invalid coding question, using fallback');
-                codeQ = {
+            if (updatedSession && updatedSession.questions) {
+                updateSession(sessionId, updatedSession);
+                session = getSession(sessionId)!;
+                console.log(`  ✓ Next question generated via Agent Context`);
+            }
+        } catch (err) {
+            console.warn('  ⚠ Interviewer failed, using fallback');
+            // Fallback logic
+            if (isLastVideoQ) {
+                addQuestion(sessionId, {
                     type: 'code',
-                    text: 'Create a custom React hook called useDebounce that takes a value and a delay in milliseconds. The hook should return the debounced value that only updates after the specified delay has passed since the last change.',
+                    text: 'Create a custom React hook called useDebounce...',
                     title: 'Custom useDebounce Hook',
-                    difficulty: nextDifficulty,
-                    starterCode: 'import { useState, useEffect } from "react";\n\nfunction useDebounce(value, delay) {\n  // Your implementation here\n}\n\nexport default useDebounce;\n',
+                    difficulty: session.currentDifficulty,
+                    starterCode: '// Write your solution here\n',
                     language: 'javascript',
-                };
-            }
-
-            nextQuestion = addQuestion(sessionId, {
-                type: 'code',
-                text: codeQ.text,
-                title: codeQ.title || 'Coding Challenge',
-                difficulty: codeQ.difficulty || nextDifficulty,
-                starterCode: codeQ.starterCode || '// Write your solution here\n',
-                language: codeQ.language || 'javascript',
-            });
-        } else {
-            // Generate next video question
-            const qNumber = completedQuestions + 1;
-            console.log(`  → Generating Q${qNumber + 1} (${nextDifficulty})...`);
-
-            const nextPrompt = `
-You are interviewing a candidate for "${session.role}" at "${session.company}".
-This is question #${qNumber + 1}. Difficulty: ${nextDifficulty}.
-Topic: React JS only.
-
-Previous interview context:
-${buildInterviewContext(session)}
-
-Based on the candidate's previous answers (or skipped questions), generate the NEXT React JS follow-up question.
-IMPORTANT: Ensure this question is DIFFERENT from all previously asked questions listed above.
-- If they skipped the last question, ask a different question of the same difficulty.
-- If they did well, probe deeper into advanced React topics (concurrent mode, suspense, server components, reconciliation, fiber architecture)
-- If they struggled, ask about fundamental React concepts (hooks, state, props, effects)
-- It should be a "video" type question (not coding)
-Respond with ONLY a JSON object like: {"type":"video","text":"your question","title":"short title","difficulty":"${nextDifficulty}"}`;
-
-            const nextRaw = await sendToAgent(getAgents().interviewer, [
-                { role: 'user', content: nextPrompt },
-            ]);
-
-            let nextQ: InterviewerResponse;
-            try {
-                nextQ = parseAgentJSON<InterviewerResponse>(nextRaw);
-            } catch {
-                console.warn('  ⚠ Interviewer returned empty/invalid next question, using fallback');
-                const fallbackQs = [
-                    { text: 'What is the virtual DOM in React and how does it improve performance?', title: 'Virtual DOM' },
-                    { text: 'Explain the useEffect cleanup function. When and why would you use it?', title: 'useEffect Cleanup' },
-                    { text: 'What are React keys and why are they important when rendering lists?', title: 'React Keys' },
-                ];
-                const pick = fallbackQs[Math.floor(Math.random() * fallbackQs.length)];
-                nextQ = {
+                });
+            } else {
+                addQuestion(sessionId, {
                     type: 'video',
-                    text: pick.text,
-                    title: pick.title,
-                    difficulty: nextDifficulty,
-                };
+                    text: 'What are React keys and why are they important?',
+                    title: 'React Keys',
+                    difficulty: session.currentDifficulty,
+                });
             }
-
-            nextQuestion = addQuestion(sessionId, {
-                type: nextQ.type || 'video',
-                text: nextQ.text,
-                title: nextQ.title,
-                difficulty: nextQ.difficulty || nextDifficulty,
-            });
+            session = getSession(sessionId)!;
         }
 
-        console.log(`  ✓ Next question ready`);
+        const nextQ = session.questions[session.questions.length - 1];
+        const currentEval = session.questions.find(q => q.id === questionId)?.evaluation;
 
         res.json({
-            evaluation: {
-                score: evaluation.score,
-                strengths: evaluation.strengths,
-                weaknesses: evaluation.weaknesses,
-                brief: evaluation.brief,
-                nextDifficulty: evaluation.nextDifficulty,
-            },
-            nextQuestion: nextQuestion ? {
-                id: nextQuestion.id,
-                type: nextQuestion.type,
-                text: nextQuestion.text,
-                title: nextQuestion.title,
-                difficulty: nextQuestion.difficulty,
-                starterCode: nextQuestion.starterCode,
-                language: nextQuestion.language,
-            } : null,
+            evaluation: currentEval,
+            nextQuestion: nextQ.id !== questionId ? nextQ : null,
             isLastVideoQuestion: isLastVideoQ,
             currentQuestion: session.questions.length,
             totalQuestions: session.totalVideoQuestions + 1,
         });
+
     } catch (error) {
         console.error('❌ Answer error:', error);
         res.status(500).json({ error: (error as Error).message });
@@ -357,16 +293,19 @@ Respond with ONLY a JSON object like: {"type":"video","text":"your question","ti
 // ─── POST /api/interview/submit-code ────────────────────
 // Sends code to the Code Reviewer Agent
 
+// ─── POST /api/interview/submit-code ────────────────────
+// Sends code to the Code Reviewer Agent
+
 interviewRouter.post('/submit-code', async (req: Request, res: Response) => {
     try {
         const { sessionId, questionId, code, language } = req.body;
 
-        if (!sessionId || !questionId || !code) {
-            res.status(400).json({ error: 'sessionId, questionId, and code are required' });
+        if (!sessionId || !questionId) {
+            res.status(400).json({ error: 'sessionId and questionId are required' });
             return;
         }
 
-        const session = getSession(sessionId);
+        let session = getSession(sessionId);
         if (!session) {
             res.status(404).json({ error: 'Session not found' });
             return;
@@ -380,50 +319,17 @@ interviewRouter.post('/submit-code', async (req: Request, res: Response) => {
 
         console.log(`\n💻 Reviewing code submission for session ${sessionId}`);
 
-        // Record the code as the "answer"
+        // 1. Record the code locally
         recordAnswer(sessionId, questionId, code);
+        session = getSession(sessionId)!;
 
-        // Send to Code Reviewer Agent
-        const reviewPrompt = `
-You are an expert code reviewer evaluating interview coding submissions. You receive the problem description and the candidate's submitted code.
-
-Problem: ${codeQ.title}
-Description: ${codeQ.text}
-
-Submitted Code (${language || 'javascript'}):
-\`\`\`${language || 'javascript'}
-${code}
-\`\`\`
-
-EVALUATE: correctness, efficiency (time/space complexity), code quality, edge case handling, readability.
-
-RESPONSE FORMAT (strict JSON):
-{
-  "score": 82,
-  "maxScore": 100,
-  "correctness": true,
-  "timeComplexity": "O(n)",
-  "spaceComplexity": "O(n)",
-  "strengths": ["Handles edge cases", "Clean recursion"],
-  "issues": ["Could use iterative approach for better space"],
-  "brief": "One-line summary"
-}
-
-Check the code inside the function and give scoring according to the logic written inside the function and nothing else.
-
-Never include anything outside the JSON object.`;
-
-        const reviewRaw = await sendToAgent(getAgents().codeReviewer, [
-            { role: 'user', content: reviewPrompt },
-        ]);
-
-        let review: CodeReviewResponse;
+        // 2. Call Code Reviewer
         const isEmptyCode = !code || code.trim().length < 10 || code.trim() === '// Write your solution here';
+
         if (isEmptyCode) {
-            console.warn('  ⚠ Empty or no code submitted, scoring 0');
-            review = {
+            console.warn('  ⚠ Empty code submitted');
+            const emptyReview: QuestionRecord['codeReview'] = {
                 score: 0,
-                maxScore: 100,
                 correctness: false,
                 timeComplexity: 'N/A',
                 spaceComplexity: 'N/A',
@@ -431,51 +337,52 @@ Never include anything outside the JSON object.`;
                 issues: ['No code was submitted'],
                 brief: 'Candidate did not submit any code.',
             };
+            recordCodeReview(sessionId, questionId, emptyReview);
         } else {
+            const reviewInstruction = `
+You are the Code Reviewer.
+1. Review the code answer for Question ID ${questionId}.
+2. Update the session by adding a "codeReview" object to that question.
+3. Return the FULL updated session JSON.
+`;
             try {
-                review = parseAgentJSON<CodeReviewResponse>(reviewRaw);
-            } catch {
-                console.warn('  ⚠ Code Reviewer returned empty/invalid response, using fallback');
-                review = {
+                const updatedSession = await sendContextToAgent<any>(
+                    getAgents().codeReviewer,
+                    session as unknown as Record<string, unknown>,
+                    reviewInstruction
+                );
+
+                if (updatedSession && updatedSession.questions) {
+                    updateSession(sessionId, updatedSession);
+                    session = getSession(sessionId)!;
+                    console.log(`  ✓ Code review recorded via Agent Context`);
+                }
+            } catch (err) {
+                console.warn('  ⚠ Code Reviewer failed, using fallback');
+                recordCodeReview(sessionId, questionId, {
                     score: 0,
-                    maxScore: 100,
                     correctness: false,
                     timeComplexity: 'N/A',
                     spaceComplexity: 'N/A',
                     strengths: [],
                     issues: ['AI code review unavailable'],
                     brief: 'Code review could not be completed.',
-                };
+                });
             }
         }
-        recordCodeReview(sessionId, questionId, {
-            score: review.score,
-            correctness: review.correctness,
-            timeComplexity: review.timeComplexity,
-            spaceComplexity: review.spaceComplexity,
-            strengths: review.strengths,
-            issues: review.issues,
-            brief: review.brief,
-        });
 
-        console.log(`  ✓ Code review: ${review.score}/100 | Correct: ${review.correctness}`);
+        session = getSession(sessionId)!;
+        const review = session.questions.find(q => q.id === questionId)?.codeReview;
 
-        res.json({
-            review: {
-                score: review.score,
-                correctness: review.correctness,
-                timeComplexity: review.timeComplexity,
-                spaceComplexity: review.spaceComplexity,
-                strengths: review.strengths,
-                issues: review.issues,
-                brief: review.brief,
-            },
-        });
+        res.json({ review });
     } catch (error) {
         console.error('❌ Code review error:', error);
         res.status(500).json({ error: (error as Error).message });
     }
 });
+
+// ─── POST /api/interview/complete ───────────────────────
+// Sends all interview data to the Analyst Agent for final report
 
 // ─── POST /api/interview/complete ───────────────────────
 // Sends all interview data to the Analyst Agent for final report
@@ -489,7 +396,7 @@ interviewRouter.post('/complete', async (req: Request, res: Response) => {
             return;
         }
 
-        const session = getSession(sessionId);
+        let session = getSession(sessionId);
         if (!session) {
             res.status(404).json({ error: 'Session not found' });
             return;
@@ -497,26 +404,7 @@ interviewRouter.post('/complete', async (req: Request, res: Response) => {
 
         console.log(`\n📊 Generating final analysis for session ${sessionId}`);
 
-        // Build comprehensive data for the Analyst
-        const interviewData = session.questions.map((q, i) => ({
-            questionNumber: i + 1,
-            type: q.type,
-            difficulty: q.difficulty,
-            question: q.text,
-            title: q.title,
-            answer: q.answer || 'No answer provided',
-            evaluation: q.evaluation ? {
-                score: q.evaluation.score,
-                strengths: q.evaluation.strengths,
-                weaknesses: q.evaluation.weaknesses,
-            } : null,
-            codeReview: q.codeReview ? {
-                score: q.codeReview.score,
-                correctness: q.codeReview.correctness,
-                timeComplexity: q.codeReview.timeComplexity,
-            } : null,
-        }));
-
+        // Calculate duration outside the agent to ensure accuracy
         const startTime = new Date(session.startedAt);
         const endTime = new Date();
         const durationMs = endTime.getTime() - startTime.getTime();
@@ -524,36 +412,47 @@ interviewRouter.post('/complete', async (req: Request, res: Response) => {
         const seconds = Math.floor((durationMs % 60000) / 1000);
         const totalTime = `${minutes}:${seconds.toString().padStart(2, '0')}`;
 
-        const analysisPrompt = `
-Generate a comprehensive interview analysis report.
+        const analysisInstruction = `
+You are the Analyst.
+1. Review the full interview session.
+2. Generate a comprehensive "analysis" object.
+3. Include: overallScore, recommendation, summary, skillScores, questionResults, feedback.
+4. Ensure "totalTime" is set to "${totalTime}".
+5. Update the session by adding this "analysis" object.
+6. Return the FULL updated session JSON.
+`;
 
-Role: ${session.role} at ${session.company}
-Duration: ${totalTime}
-
-Full Interview Data:
-${JSON.stringify(interviewData, null, 2)}
-
-Create a detailed analysis with overall score, skill scores, per-question results, and feedback.
-The totalTime field should be "${totalTime}".
-Respond with ONLY a JSON object.`;
-
-        const analysisRaw = await sendToAgent(getAgents().analyst, [
-            { role: 'user', content: analysisPrompt },
-        ]);
-
-        let analysis: Record<string, unknown>;
         try {
-            analysis = parseAgentJSON<Record<string, unknown>>(analysisRaw);
-        } catch {
-            console.warn('  ⚠ Analyst returned empty/invalid response, generating fallback analysis');
-            // Build fallback analysis from session data
+            const updatedSession = await sendContextToAgent<any>(
+                getAgents().analyst,
+                session as unknown as Record<string, unknown>,
+                analysisInstruction
+            );
+
+            if (updatedSession && updatedSession.analysis) {
+                // Ensure totalTime is preserved/set if agent missed it
+                if (!updatedSession.analysis.totalTime) {
+                    updatedSession.analysis.totalTime = totalTime;
+                }
+
+                updateSession(sessionId, updatedSession);
+                completeSession(sessionId, updatedSession.analysis); // Marks completedAt
+                session = getSession(sessionId)!;
+                console.log(`  ✓ Analysis generated via Agent Context`);
+            } else {
+                throw new Error('Analyst returned invalid session structure');
+            }
+
+        } catch (err) {
+            console.warn('  ⚠ Analyst failed, using fallback');
+            // Fallback logic
             const scores = session.questions
                 .filter(q => q.evaluation)
                 .map(q => q.evaluation!.score);
             const avgScore = scores.length > 0 ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
             const codeScore = session.questions.find(q => q.codeReview)?.codeReview?.score ?? 0;
 
-            analysis = {
+            const fallbackAnalysis = {
                 overallScore: Math.round((avgScore + codeScore) / 2),
                 recommendation: avgScore >= 80 ? 'Strong Hire' : avgScore >= 65 ? 'Hire' : avgScore >= 50 ? 'Maybe' : 'No Hire',
                 summary: `Candidate completed the ${session.role} interview. Average question score: ${avgScore}/100. Code challenge score: ${codeScore}/100.`,
@@ -580,18 +479,11 @@ Respond with ONLY a JSON object.`;
                     ),
                 ],
             };
+            completeSession(sessionId, fallbackAnalysis);
+            session = getSession(sessionId)!;
         }
 
-        // Ensure totalTime is set
-        if (!analysis.totalTime) {
-            analysis.totalTime = totalTime;
-        }
-
-        completeSession(sessionId, analysis);
-
-        console.log(`  ✓ Analysis complete`);
-
-        res.json({ analysis });
+        res.json({ analysis: session.analysis });
     } catch (error) {
         console.error('❌ Analysis error:', error);
         res.status(500).json({ error: (error as Error).message });

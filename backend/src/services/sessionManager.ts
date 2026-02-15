@@ -145,6 +145,25 @@ export function completeSession(sessionId: string, analysis: Record<string, unkn
 }
 
 /**
+ * Update the session with new data.
+ * This is used when an agent returns an updated session object.
+ */
+export function updateSession(sessionId: string, updates: Partial<InterviewSession>): InterviewSession {
+    const session = sessions.get(sessionId);
+    if (!session) throw new Error(`Session ${sessionId} not found`);
+
+    // Merge updates into the session
+    // We do a shallow merge for top-level properties
+    const updatedSession = { ...session, ...updates };
+
+    // Ensure ID and immutable properties are not overwritten (unless we really want to, but safety first)
+    updatedSession.id = session.id;
+
+    sessions.set(sessionId, updatedSession);
+    return updatedSession;
+}
+
+/**
  * Build a context string summarizing all previous Q&A for the interviewer
  */
 export function buildInterviewContext(session: InterviewSession): string {
