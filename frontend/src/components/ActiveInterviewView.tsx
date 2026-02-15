@@ -81,6 +81,13 @@ const ActiveInterviewView: React.FC<ActiveInterviewViewProps> = ({ onLeave, onCo
     const streamRef = useRef<MediaStream | null>(null);
     const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
     const transcriptRef = useRef<HTMLDivElement>(null);
+    const recordingStatusRef = useRef<string>(status);
+
+    // Sync ref with status state
+    useEffect(() => {
+        recordingStatusRef.current = status;
+    }, [status]);
+
 
     // ─── Camera & Mic ───────────────────────────────────
 
@@ -146,10 +153,14 @@ const ActiveInterviewView: React.FC<ActiveInterviewViewProps> = ({ onLeave, onCo
         };
 
         recognition.onend = () => {
-            if (recognitionRef.current && micEnabled) {
+            // If the user stopped speaking for a while, the browser might stop the recognition.
+            // We immediately restart it if we are still supposed to be recording.
+            if (recordingStatusRef.current === 'recording' && micEnabled) {
                 try {
                     recognition.start();
-                } catch { /* ignore */ }
+                } catch (e) {
+                    console.error('Failed to restart recognition:', e);
+                }
             }
         };
 
@@ -247,6 +258,8 @@ const ActiveInterviewView: React.FC<ActiveInterviewViewProps> = ({ onLeave, onCo
 
     // Start/stop recognition based on status and mic
     useEffect(() => {
+        // Only start recognition if we are in the 'recording' phase AND mic is enabled.
+        // This effectively disables it during 'loading' and 'countdown'.
         if (status === 'recording' && micEnabled) {
             startRecognition();
         } else {
