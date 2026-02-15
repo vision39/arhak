@@ -10,14 +10,27 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Middleware
+const allowedOrigins = [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    process.env.FRONTEND_URL
+].filter(Boolean); // Filter out undefined values
+
 app.use(cors({
-    origin: [
-        'http://localhost:5173',
-        'http://localhost:3000',
-        process.env.FRONTEND_URL || '*' // Allow Vercel frontend
-    ],
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+
+        // TEMPORARY: Allow all origins to debug Vercel deployment
+        // Once working, revert to strict checking
+        if (allowedOrigins.indexOf(origin) === -1) {
+            console.log(`⚠️ Allowing untrusted origin: ${origin}`);
+        }
+        callback(null, true);
+    },
     credentials: true,
 }));
+app.options('*', cors()); // Enable pre-flight for all routes
 app.use(express.json({ limit: '10mb' }));
 
 // Routes
