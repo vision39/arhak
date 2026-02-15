@@ -24,6 +24,15 @@ app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Root route for deployment checks
+app.get('/', (_req, res) => {
+    res.json({
+        status: 'ok',
+        service: 'Interview Backend',
+        timestamp: new Date().toISOString()
+    });
+});
+
 // Start
 app.listen(PORT, () => {
     console.log(`\n🚀 Interview Backend running on http://localhost:${PORT}`);
