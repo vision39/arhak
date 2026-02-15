@@ -89,6 +89,7 @@ const CompletionPage: React.FC = () => {
             .then(response => {
                 clearInterval(stepInterval);
                 setAnalysisStep(analysisSteps.length - 1);
+                console.log('Analysis Data:', JSON.stringify(response.analysis, null, 2));
 
                 setAnalysisData(response.analysis);
 

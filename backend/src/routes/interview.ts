@@ -14,6 +14,7 @@ import {
     completeSession,
     updateSession,
     buildInterviewContext,
+    getLowerDifficulty,
     type Difficulty,
     type QuestionRecord,
 } from '../services/sessionManager.js';
@@ -169,12 +170,16 @@ interviewRouter.post('/answer', async (req: Request, res: Response) => {
         // 2. Evaluator Step
         if (skipped) {
             console.log(`\n⏭ Question Q${questionId} skipped.`);
+
+            const newDifficulty = getLowerDifficulty(session.currentDifficulty);
+            console.log(`   - Lowering difficulty: ${session.currentDifficulty} -> ${newDifficulty}`);
+
             // Mock evaluation for skipped
             const skippedEval: EvaluatorResponse = {
                 score: 0,
                 maxScore: 100,
                 difficulty: session.currentDifficulty,
-                nextDifficulty: session.currentDifficulty,
+                nextDifficulty: newDifficulty,
                 strengths: [],
                 weaknesses: ['Question skipped'],
                 brief: 'Question skipped by candidate.',
@@ -483,7 +488,6 @@ You are the Analyst.
             session = getSession(sessionId)!;
         }
 
-        console.log(JSON.stringify(session, null, 2));
         res.json({ analysis: session.analysis });
     } catch (error) {
         console.error('❌ Analysis error:', error);

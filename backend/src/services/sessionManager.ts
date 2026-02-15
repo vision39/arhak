@@ -4,7 +4,15 @@
  */
 import { v4 as uuidv4 } from 'uuid';
 
+
 export type Difficulty = 'easy' | 'medium' | 'hard';
+
+export function getLowerDifficulty(current: Difficulty): Difficulty {
+    if (current === 'hard') return 'medium';
+    if (current === 'medium') return 'easy';
+    return 'easy';
+}
+
 
 export interface QuestionRecord {
     id: number;
@@ -158,6 +166,14 @@ export function updateSession(sessionId: string, updates: Partial<InterviewSessi
 
     // Ensure ID and immutable properties are not overwritten (unless we really want to, but safety first)
     updatedSession.id = session.id;
+
+    // Sanitize questions: Ensure they all have IDs
+    if (updatedSession.questions) {
+        updatedSession.questions = updatedSession.questions.map((q, index) => ({
+            ...q,
+            id: q.id || (index + 1),
+        }));
+    }
 
     sessions.set(sessionId, updatedSession);
     return updatedSession;
